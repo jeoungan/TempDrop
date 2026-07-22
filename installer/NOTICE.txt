@@ -1,0 +1,13 @@
+IMPORTANT: PERMANENT FILE DELETION
+
+TempDrop permanently deletes expired files from its dedicated managed folder.
+Deleted files do not go to the Recycle Bin and cannot be restored by TempDrop.
+
+Deletion remains disabled until first launch, when the user must:
+
+1. Select a dedicated managed folder.
+2. Select a retention period.
+3. Explicitly accept the permanent-deletion warning.
+
+Uninstalling TempDrop removes its scheduled task but preserves the managed folder,
+configuration, and remaining files. TempDrop does not upload files or send telemetry.

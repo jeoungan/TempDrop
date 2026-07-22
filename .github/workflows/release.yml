@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $version = '${{ inputs.version }}'
+            $tag = "v$version"
+          } else {
+            $tag = '${{ github.ref_name }}'
+            $version = $tag.TrimStart('v')
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version must use MAJOR.MINOR.PATCH format: $version"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build
+        shell: pwsh
+        run: ./scripts/build.ps1 -Configuration Release
+
+      - name: Test deletion boundaries
+        shell: pwsh
+        run: ./scripts/test.ps1
+
+      - name: Prepare optional signing certificate
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64) -or [string]::IsNullOrWhiteSpace($env:CERTIFICATE_PASSWORD)) {
+            'SIGNING_ENABLED=false' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host 'Code-signing secrets are not configured; publishing unsigned artifacts.'
+            exit 0
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'tempdrop-signing.pfx'
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signTool) { throw 'signtool.exe was not found.' }
+          "SIGNING_ENABLED=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CERTIFICATE_PATH=$certificatePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SIGNTOOL_PATH=$($signTool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Sign application
+        if: env.SIGNING_ENABLED == 'true'
+        shell: pwsh
+        env:
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          & $env:SIGNTOOL_PATH sign /f $env:CERTIFICATE_PATH /p $env:CERTIFICATE_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 artifacts/build/TempDrop.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Application signing failed.' }
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          Copy-Item artifacts/build/TempDrop.exe artifacts/TempDrop-portable/TempDrop.exe -Force
+          $zipPath = "artifacts/TempDrop-$version-portable.zip"
+          Compress-Archive -Path 'artifacts/TempDrop-portable/*' -DestinationPath $zipPath -CompressionLevel Optimal
+
+      - name: Install Inno Setup if needed
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          if (-not (Test-Path $iscc)) { throw 'Inno Setup compiler was not found.' }
+          "ISCC_PATH=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          & $env:ISCC_PATH "/DMyAppVersion=$version" installer/TempDrop.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
+
+      - name: Sign installer
+        if: env.SIGNING_ENABLED == 'true'
+        shell: pwsh
+        env:
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          & $env:SIGNTOOL_PATH sign /f $env:CERTIFICATE_PATH /p $env:CERTIFICATE_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "artifacts/TempDrop-$version-setup-x64.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed.' }
+
+      - name: Write checksums
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $files = @(
+            "artifacts/TempDrop-$version-portable.zip",
+            "artifacts/TempDrop-$version-setup-x64.exe"
+          )
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+            "$hash  $([IO.Path]::GetFileName($file))"
+          }
+          $lines | Set-Content artifacts/SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: TempDrop-${{ steps.version.outputs.version }}
+          path: |
+            artifacts/TempDrop-${{ steps.version.outputs.version }}-portable.zip
+            artifacts/TempDrop-${{ steps.version.outputs.version }}-setup-x64.exe
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $tag = '${{ steps.version.outputs.tag }}'
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            git tag $tag
+            git push origin $tag
+          }
+          gh release create $tag `
+            "artifacts/TempDrop-$version-portable.zip" `
+            "artifacts/TempDrop-$version-setup-x64.exe" `
+            artifacts/SHA256SUMS.txt `
+            --title "TempDrop $version" `
+            --generate-notes `
+            --verify-tag

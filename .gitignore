@@ -1,0 +1,24 @@
+# Build output
+artifacts/
+bin/
+obj/
+*.pdb
+
+# Local configuration and secrets
+*.pfx
+*.snk
+.env
+
+# IDE and OS files
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+
+# Image-generation source retained locally only
+assets/tempdrop-icon-chroma.png
+
+# PowerShell prototype (not part of the public .NET release)
+prototype-powershell/
